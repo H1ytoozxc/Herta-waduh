@@ -1,4 +1,8 @@
 ollama
+openai
+httpx
+google-genai
+omegaconf
 sounddevice
 faster-whisper
 silero-vad
@@ -7,3 +11,4 @@ numpy
 pydantic
 python-dotenv
 rich
+piper-tts

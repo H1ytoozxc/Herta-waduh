@@ -1,7 +1,14 @@
 ﻿import argparse
+import asyncio
 import logging
+import time
+from typing import Protocol
 
+from brain.memory import DialogueMemory
 from config import AppConfig, load_config
+from llm.deepseek_client import DeepSeekChatClient
+from llm.google_ai_client import GoogleAIChatClient
+from llm.google_live_client import GoogleLiveVoiceClient
 from llm.ollama_client import OllamaChatClient
 from persona.the_herta import (
     build_bootstrap_messages,
@@ -17,6 +24,21 @@ from utils.logger import configure_logging
 
 
 EXIT_COMMANDS = {"exit", "quit", "q", "выход"}
+TTS_TEST_PHRASE = "Это Великая Герта. Проверка голосового вывода завершена."
+GOOGLE_AI_PROVIDER_NAMES = {"google_ai", "google", "gemini"}
+
+
+class ChatClient(Protocol):
+    @property
+    def last_warmup_error(self) -> str | None: ...
+
+    def warm_up(self) -> bool: ...
+
+    def chat(self, messages: list[dict[str, str]]) -> str: ...
+
+
+class TTSEngine(Protocol):
+    def speak(self, text: str) -> None: ...
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,9 +55,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run microphone -> VAD -> STT -> LLM -> TTS loop.",
     )
     parser.add_argument(
+        "--live-voice",
+        action="store_true",
+        help="Run Google Live API native audio loop. Bypasses local Whisper and TTS.",
+    )
+    parser.add_argument(
+        "--tts-test",
+        action="store_true",
+        help="Play a short TTS test phrase and exit.",
+    )
+    parser.add_argument(
+        "--output-test",
+        action="store_true",
+        help="Play a short sine-wave tone through the configured output device and exit.",
+    )
+    parser.add_argument(
         "--list-devices",
         action="store_true",
         help="List available input audio devices and exit.",
+    )
+    parser.add_argument(
+        "--list-output-devices",
+        action="store_true",
+        help="List available output audio devices and exit.",
     )
     parser.add_argument(
         "--no-tts",
@@ -43,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable speech output for this run.",
     )
     return parser
+
 
 
 def trim_history(
@@ -73,7 +116,7 @@ def generate_assistant_reply(
     *,
     user_text: str,
     messages: list[dict[str, str]],
-    chat_client: OllamaChatClient,
+    chat_client: ChatClient,
     config: AppConfig,
 ) -> str:
     if is_identity_query(user_text):
@@ -100,20 +143,36 @@ def run_turn(
     *,
     user_text: str,
     messages: list[dict[str, str]],
-    chat_client: OllamaChatClient,
-    tts_engine: EdgeTTSEngine | None,
+    chat_client: ChatClient,
+    tts_engine: TTSEngine | None,
     config: AppConfig,
     logger: logging.Logger,
     locked_prefix_count: int,
+    memory_store: DialogueMemory | None,
 ) -> str:
     messages.append({"role": "user", "content": user_text})
+
+    logger.info(
+        "Generating reply with %s model '%s'...",
+        config.llm_provider,
+        _selected_model_name(config),
+    )
+    started_at = time.perf_counter()
     assistant_reply = generate_assistant_reply(
         user_text=user_text,
         messages=messages,
         chat_client=chat_client,
         config=config,
     )
+    elapsed_seconds = time.perf_counter() - started_at
+    logger.info("Assistant reply ready in %.1fs.", elapsed_seconds)
+
     messages.append({"role": "assistant", "content": assistant_reply})
+    if memory_store is not None:
+        try:
+            memory_store.append_turn(user_text, assistant_reply)
+        except Exception as exc:
+            logger.warning("Failed to save dialogue memory: %s", exc)
 
     messages[:] = trim_history(messages, config.max_history_messages, locked_prefix_count)
 
@@ -130,11 +189,12 @@ def run_turn(
 def interactive_loop(
     *,
     messages: list[dict[str, str]],
-    chat_client: OllamaChatClient,
-    tts_engine: EdgeTTSEngine | None,
+    chat_client: ChatClient,
+    tts_engine: TTSEngine | None,
     config: AppConfig,
     logger: logging.Logger,
     locked_prefix_count: int,
+    memory_store: DialogueMemory | None,
 ) -> None:
     print("The Herta assistant ready. Type a message or 'exit' to quit.")
 
@@ -160,6 +220,7 @@ def interactive_loop(
                 config=config,
                 logger=logger,
                 locked_prefix_count=locked_prefix_count,
+                memory_store=memory_store,
             )
         except Exception as exc:
             logger.error("Assistant turn failed: %s", exc)
@@ -172,15 +233,32 @@ def interactive_loop(
 def voice_loop(
     *,
     messages: list[dict[str, str]],
-    chat_client: OllamaChatClient,
-    tts_engine: EdgeTTSEngine | None,
+    chat_client: ChatClient,
+    tts_engine: TTSEngine | None,
     config: AppConfig,
     logger: logging.Logger,
     locked_prefix_count: int,
+    memory_store: DialogueMemory | None,
 ) -> None:
     from audio.input import MicrophoneInput
     from audio.vad import StreamingVADSegmenter
     from stt.whisper_stt import FasterWhisperSTT
+
+    provider_name = config.llm_provider
+    model_name = _selected_model_name(config)
+
+    print(f"Preparing {provider_name} model '{model_name}'. This may take a few seconds.")
+    warmed_up = chat_client.warm_up()
+    if warmed_up:
+        print(f"{provider_name} model ready.")
+    else:
+        warmup_error = chat_client.last_warmup_error
+        warmup_error_suffix = f": {warmup_error}" if warmup_error else ""
+        logger.info(
+            "%s model is not ready%s. The first reply may take longer.",
+            provider_name,
+            warmup_error_suffix,
+        )
 
     print(
         f"Preparing voice mode. Loading Whisper model '{config.stt.model_size}' on device '{config.stt.device}'. "
@@ -246,6 +324,7 @@ def voice_loop(
                     config=config,
                     logger=logger,
                     locked_prefix_count=locked_prefix_count,
+                    memory_store=memory_store,
                 )
             except Exception as exc:
                 logger.error("Assistant turn failed: %s", exc)
@@ -254,8 +333,46 @@ def voice_loop(
             print(f"The Herta> {assistant_reply}")
 
 
+def google_live_voice_loop(
+    *,
+    messages: list[dict[str, str]],
+    config: AppConfig,
+    logger: logging.Logger,
+    memory_store: DialogueMemory | None,
+) -> None:
+    client = GoogleLiveVoiceClient(config.google_ai)
+    model_name = config.google_ai.live_model
 
-def print_audio_devices() -> int:
+    print(f"Preparing Google Live model '{model_name}'. This may take a few seconds.")
+    warmed_up = client.warm_up()
+    if warmed_up:
+        print("Google Live model ready.")
+    else:
+        warmup_error = client.last_warmup_error
+        warmup_error_suffix = f": {warmup_error}" if warmup_error else ""
+        logger.info("Google Live model is not ready%s.", warmup_error_suffix)
+
+    print(
+        "Google Live voice mode ready. This bypasses local Whisper and local TTS. "
+        "Speak into the microphone. Press Ctrl+C to stop."
+    )
+    print(
+        f"Google Live output: device={_describe_output_device(config.audio_output.device)}, "
+        f"sample_rate=24000, channels={config.audio_output.channels}."
+    )
+    print(f"Google Live voice preset: {config.google_ai.live_voice_name or 'auto'}.")
+    asyncio.run(
+        client.run_voice_loop(
+            messages=messages,
+            audio_config=config.audio,
+            audio_output_config=config.audio_output,
+            memory_store=memory_store,
+        )
+    )
+
+
+
+def print_input_devices() -> int:
     from audio.input import list_input_devices
 
     devices = list_input_devices()
@@ -269,20 +386,188 @@ def print_audio_devices() -> int:
 
 
 
+def print_output_devices() -> int:
+    from audio.output import list_output_devices
+
+    devices = list_output_devices()
+    if not devices:
+        print("No output audio devices found.")
+        return 1
+
+    for description in devices:
+        print(description)
+    return 0
+
+
+
+def run_output_test(config: AppConfig, logger: logging.Logger) -> int:
+    from audio.output import SpeakerOutput, describe_output_device
+
+    print(f"Configured output device: {describe_output_device(config.audio_output.device)}")
+    try:
+        SpeakerOutput(config.audio_output).play_test_tone()
+    except Exception as exc:
+        logger.error("Output test failed: %s", exc)
+        return 1
+
+    print("Output tone test completed.")
+    return 0
+
+
+
+def _is_base_qwen3_model(model_name: str) -> bool:
+    normalized = model_name.strip().lower()
+    return normalized.startswith("qwen3:") or normalized == "qwen3"
+
+
+
+def _describe_output_device(device: int | str | None) -> str:
+    try:
+        from audio.output import describe_output_device
+
+        return describe_output_device(device)
+    except Exception:
+        return "unknown"
+
+
+def _selected_model_name(config: AppConfig) -> str:
+    if config.llm_provider == "deepseek":
+        return config.deepseek.model
+    if config.llm_provider in GOOGLE_AI_PROVIDER_NAMES:
+        return config.google_ai.model
+    return config.ollama.model
+
+
+def _build_chat_client(config: AppConfig) -> ChatClient:
+    if config.llm_provider == "ollama":
+        return OllamaChatClient(config.ollama)
+    if config.llm_provider == "deepseek":
+        return DeepSeekChatClient(config.deepseek)
+    if config.llm_provider in GOOGLE_AI_PROVIDER_NAMES:
+        return GoogleAIChatClient(config.google_ai)
+    raise ValueError("Unsupported LLM_PROVIDER. Use 'ollama', 'deepseek', or 'google_ai'.")
+
+
+def _build_tts_engine(config: AppConfig, *, no_tts: bool, live_voice: bool) -> TTSEngine | None:
+    if no_tts or live_voice:
+        return None
+    if config.rvc_tts.enabled:
+        from tts.rvc_tts_engine import RvcTTSEngine
+
+        return RvcTTSEngine(config.rvc_tts, config.audio_output)
+    if not config.tts.enabled:
+        return None
+    return EdgeTTSEngine(config.tts, config.audio_output)
+
+
+def _build_memory_store(config: AppConfig, logger: logging.Logger) -> DialogueMemory | None:
+    if not config.memory.enabled:
+        return None
+
+    memory_store = DialogueMemory(config.memory)
+    try:
+        memory_store.load_context_messages()
+    except Exception as exc:
+        logger.warning("Dialogue memory is disabled for this run: %s", exc)
+        return None
+
+    logger.info("Dialogue memory ready. path=%s.", memory_store.path)
+    return memory_store
+
+
+
 def main() -> int:
     args = build_parser().parse_args()
 
+    if args.voice and args.live_voice:
+        print("Use either --voice or --live-voice, not both.")
+        return 1
+
     if args.list_devices:
-        return print_audio_devices()
+        return print_input_devices()
+
+    if args.list_output_devices:
+        return print_output_devices()
 
     config = load_config()
     configure_logging(config.log_level)
     logger = logging.getLogger("the_herta.main")
 
-    messages = build_bootstrap_messages()
+    if args.output_test:
+        return run_output_test(config, logger)
+
+    tts_engine = _build_tts_engine(config, no_tts=args.no_tts, live_voice=args.live_voice)
+
+    if args.live_voice:
+        print("Local TTS disabled for Google Live native audio mode.")
+    elif tts_engine is None:
+        print("TTS disabled for this run.")
+    elif config.rvc_tts.enabled:
+        print(
+            f"RVC TTS ready. model={config.rvc_tts.model_path!r}, pitch={config.rvc_tts.pitch}, "
+            f"f0_method={config.rvc_tts.f0_method}, base_tts={config.rvc_tts.base_tts}, "
+            f"backend={config.rvc_tts.backend}."
+        )
+        print(f"Configured output device: {_describe_output_device(config.audio_output.device)}")
+        if config.rvc_tts.warm_up:
+            print("Preparing RVC voice cache. First startup can take a bit; replies after that should be faster.")
+            try:
+                warm_up = getattr(tts_engine, "warm_up")
+                warm_up()
+            except Exception as exc:
+                logger.warning("RVC TTS warm-up failed: %s", exc)
+            else:
+                print("RVC voice cache ready.")
+    else:
+        print(
+            f"TTS ready. preferred_local={config.tts.prefer_local}, sapi_voice={config.tts.sapi_voice!r}, edge_voice={config.tts.voice}."
+        )
+        print(f"Configured output device: {_describe_output_device(config.audio_output.device)}")
+        print(f"Piper model: {config.tts.piper_model_path!r}")
+
+    if args.tts_test:
+        if tts_engine is None:
+            print("TTS is disabled. Remove --no-tts or enable TTS in config.")
+            return 1
+        try:
+            tts_engine.speak(TTS_TEST_PHRASE)
+        except Exception as exc:
+            logger.error("TTS test failed: %s", exc)
+            return 1
+        print(TTS_TEST_PHRASE)
+        return 0
+
+    if not args.live_voice and config.llm_provider == "ollama" and _is_base_qwen3_model(config.ollama.model):
+        print(
+            "Warning: base qwen3 models in Ollama are usable now, but they remain much slower than gemma in live voice mode. "
+            "Use gemma for realtime speech, and qwen3 when you want higher-quality but slower answers."
+        )
+
+    selected_model_name = config.google_ai.live_model if args.live_voice else _selected_model_name(config)
+    messages = build_bootstrap_messages(selected_model_name)
     locked_prefix_count = len(messages)
-    chat_client = OllamaChatClient(config.ollama)
-    tts_engine = None if args.no_tts or not config.tts.enabled else EdgeTTSEngine(config.tts)
+    memory_store = _build_memory_store(config, logger)
+    if memory_store is not None:
+        context_messages = memory_store.load_context_messages()
+        messages.extend(context_messages)
+        logger.info("Loaded %s messages from dialogue memory.", len(context_messages))
+
+    if args.live_voice:
+        try:
+            google_live_voice_loop(
+                messages=messages,
+                config=config,
+                logger=logger,
+                memory_store=memory_store,
+            )
+        except KeyboardInterrupt:
+            print()
+        except Exception as exc:
+            logger.error("Google Live voice loop failed: %s", exc)
+            return 1
+        return 0
+
+    chat_client = _build_chat_client(config)
 
     if args.text:
         try:
@@ -294,6 +579,7 @@ def main() -> int:
                 config=config,
                 logger=logger,
                 locked_prefix_count=locked_prefix_count,
+                memory_store=memory_store,
             )
         except Exception as exc:
             logger.error("Assistant turn failed: %s", exc)
@@ -311,6 +597,7 @@ def main() -> int:
                 config=config,
                 logger=logger,
                 locked_prefix_count=locked_prefix_count,
+                memory_store=memory_store,
             )
         except Exception as exc:
             logger.error("Voice loop failed: %s", exc)
@@ -324,6 +611,7 @@ def main() -> int:
         config=config,
         logger=logger,
         locked_prefix_count=locked_prefix_count,
+        memory_store=memory_store,
     )
     return 0
 

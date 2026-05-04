@@ -37,6 +37,7 @@ Thumbs.db
 *.wav
 *.mp3
 *.log
+data/
 
 # Local model and cache directories if added later
 models/
