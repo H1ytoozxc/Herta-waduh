@@ -420,5 +420,10 @@ microphone -> VAD -> STT -> LLM -> TTS -> playback
 В этом направлении проект сейчас и движется.
 
 ## Примечание
+Следите за апдейтами в моём тгк: https://t.me/cmd_phaeton_oq
 
-Так сказать, лор-аккураси Герты в этой версии не гарантирую: на ночь тестил очень мало. Над естественностью модели буду работать тщательно. Следите за апдейтами в моём тгк: https://t.me/cmd_phaeton_oq
+
+<img width="373" height="224" alt="the-herta-hsr" src="https://github.com/user-attachments/assets/76d32225-e063-48c4-bae5-839d4ccb246f" />
+
+
+
