@@ -33,9 +33,9 @@ class GoogleAIChatClient:
         if not self.config.api_key:
             raise RuntimeError('GOOGLE_AI_API_KEY is not configured.')
 
-    def _endpoint_url(self) -> str:
+    def _endpoint_url(self, model_name: str | None = None) -> str:
         base_url = self.config.base_url.rstrip('/')
-        return f'{base_url}/models/{self.config.model}:generateContent'
+        return f'{base_url}/models/{model_name or self.config.model}:generateContent'
 
     def _retry_after_seconds(self, response: httpx.Response) -> float | None:
         retry_after = response.headers.get('retry-after')
@@ -68,7 +68,7 @@ class GoogleAIChatClient:
             return max(0, min(self.config.rate_limit_retries, len(RETRY_BACKOFF_SECONDS)))
         return max(0, min(self.config.retry_attempts, len(RETRY_BACKOFF_SECONDS)))
 
-    def _status_error_message(self, request_name: str, response: httpx.Response) -> str:
+    def _status_error_message(self, request_name: str, response: httpx.Response, model_name: str) -> str:
         provider_message = ''
         try:
             provider_message = response.json().get('error', {}).get('message', '')
@@ -78,29 +78,37 @@ class GoogleAIChatClient:
         provider_suffix = f': {provider_message}' if provider_message else ''
         if response.status_code == 429:
             return (
-                f"Google AI Studio rate limit during {request_name} for model '{self.config.model}' "
+                f"Google AI Studio rate limit during {request_name} for model '{model_name}' "
                 f'(HTTP 429){provider_suffix}'
             )
 
         return (
-            f"Google AI Studio model '{self.config.model}' is unavailable during {request_name} "
+            f"Google AI Studio model '{model_name}' is unavailable during {request_name} "
             f'(HTTP {response.status_code}){provider_suffix}'
         )
 
-    def _call_with_retry(self, request_name: str, request_fn) -> ResponseT:
+    def _call_with_retry(self, request_name: str, request_fn, *, model_name: str) -> ResponseT:
         last_error: Exception | None = None
 
         for attempt_index in range(len(RETRY_BACKOFF_SECONDS) + 1):
             try:
                 self._validate_api_key()
+                logger.info(
+                    "Google AI %s request to model '%s' started. attempt=%s timeout=%.1fs.",
+                    request_name,
+                    model_name,
+                    attempt_index + 1,
+                    self.config.timeout_seconds,
+                )
                 response = request_fn()
                 if response.status_code < 400:
+                    logger.info("Google AI %s request to model '%s' completed.", request_name, model_name)
                     return response
 
                 is_retryable = response.status_code in RETRYABLE_STATUS_CODES
                 has_more_attempts = attempt_index < self._max_status_retries(response)
                 if not is_retryable or not has_more_attempts:
-                    raise RuntimeError(self._status_error_message(request_name, response))
+                    raise RuntimeError(self._status_error_message(request_name, response, model_name))
 
                 delay_seconds = self._retry_delay_seconds(attempt_index, response)
                 logger.info(
@@ -115,14 +123,16 @@ class GoogleAIChatClient:
                 max_retries = max(0, min(self.config.retry_attempts, len(RETRY_BACKOFF_SECONDS)))
                 has_more_attempts = attempt_index < max_retries
                 if not has_more_attempts:
-                    raise RuntimeError(f'Google AI Studio request failed during {request_name}: {exc}') from exc
+                    raise RuntimeError(
+                        f"Google AI Studio request failed during {request_name} for model '{model_name}': {exc}"
+                    ) from exc
 
                 delay_seconds = self._retry_delay_seconds(attempt_index)
                 logger.info("Google AI %s retry after %.1f seconds: %s", request_name, delay_seconds, exc)
                 time.sleep(delay_seconds)
 
         raise RuntimeError(
-            f"Google AI Studio model '{self.config.model}' did not return a response during {request_name}."
+            f"Google AI Studio model '{model_name}' did not return a response during {request_name}."
         ) from last_error
 
     def _append_content(self, contents: list[dict], role: str, text: str) -> None:
@@ -174,9 +184,9 @@ class GoogleAIChatClient:
 
         return payload
 
-    def _generate_once(self, messages: list[dict[str, str]]) -> httpx.Response:
+    def _generate_once(self, messages: list[dict[str, str]], *, model_name: str | None = None) -> httpx.Response:
         return self.client.post(
-            self._endpoint_url(),
+            self._endpoint_url(model_name),
             headers={
                 'Content-Type': 'application/json',
                 'x-goog-api-key': self.config.api_key or '',
@@ -218,5 +228,25 @@ class GoogleAIChatClient:
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         self.warm_up()
-        response = self._call_with_retry('chat', lambda: self._generate_once(messages))
+        try:
+            response = self._call_with_retry(
+                'chat',
+                lambda: self._generate_once(messages, model_name=self.config.model),
+                model_name=self.config.model,
+            )
+        except RuntimeError as exc:
+            fallback_model = self.config.fallback_model
+            if not fallback_model or fallback_model == self.config.model:
+                raise
+            logger.warning(
+                "Google AI primary model '%s' failed, trying fallback model '%s': %s",
+                self.config.model,
+                fallback_model,
+                exc,
+            )
+            response = self._call_with_retry(
+                'chat fallback',
+                lambda: self._generate_once(messages, model_name=fallback_model),
+                model_name=fallback_model,
+            )
         return self._extract_content(response)

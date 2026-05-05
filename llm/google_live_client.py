@@ -1,7 +1,8 @@
 import asyncio
 import base64
+from contextlib import nullcontext
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from audio.live import LIVE_INPUT_SAMPLE_RATE, LiveAudioOutput, LiveMicrophoneInput
 from brain.memory import DialogueMemory
@@ -34,8 +35,11 @@ class GoogleLiveVoiceClient:
             logger.warning("Google Live warm-up failed: %s", exc)
             return False
 
+    def _uses_gemini_3_live(self) -> bool:
+        return self.config.live_model.startswith('gemini-3')
+
     def _api_version(self) -> str:
-        if self.config.live_affective_dialog or self.config.live_proactive_audio:
+        if not self._uses_gemini_3_live() and (self.config.live_affective_dialog or self.config.live_proactive_audio):
             return 'v1alpha'
         return self.config.live_api_version
 
@@ -46,7 +50,7 @@ class GoogleLiveVoiceClient:
 
         if self.config.live_input_transcription:
             live_config['input_audio_transcription'] = {}
-        if self.config.live_output_transcription:
+        if self.config.live_output_transcription or self.config.live_playback == 'rvc':
             live_config['output_audio_transcription'] = {}
         if self.config.live_voice_name:
             live_config['speech_config'] = {
@@ -54,18 +58,18 @@ class GoogleLiveVoiceClient:
             }
 
         thinking_config: dict[str, Any] = {}
-        if self.config.live_thinking_level and self.config.live_model.startswith('gemini-3'):
+        if self.config.live_thinking_level and self._uses_gemini_3_live():
             thinking_config['thinking_level'] = self.config.live_thinking_level
-        if self.config.live_thinking_budget is not None and not self.config.live_model.startswith('gemini-3'):
+        if self.config.live_thinking_budget is not None and not self._uses_gemini_3_live():
             thinking_config['thinking_budget'] = self.config.live_thinking_budget
         if thinking_config:
             live_config['thinking_config'] = thinking_config
 
-        if self.config.live_affective_dialog:
+        if self.config.live_affective_dialog and not self._uses_gemini_3_live():
             live_config['enable_affective_dialog'] = True
-        if self.config.live_proactive_audio:
+        if self.config.live_proactive_audio and not self._uses_gemini_3_live():
             live_config['proactivity'] = {'proactive_audio': True}
-        if self.config.live_model.startswith('gemini-3'):
+        if self._uses_gemini_3_live():
             live_config['history_config'] = {'initial_history_in_client_content': True}
 
         return live_config
@@ -121,38 +125,75 @@ class GoogleLiveVoiceClient:
         return bytes(raw_data)
 
     def _append_transcription(self, chunks: list[str], text: str | None) -> None:
-        if text:
-            chunks.append(text)
+        if not text:
+            return
+
+        current_text = ''.join(chunks)
+        if current_text and text.startswith(current_text):
+            chunks[:] = [text]
+            return
+        if current_text.endswith(text):
+            return
+        chunks.append(text)
+
+    def _select_output_chunks(
+        self,
+        transcription_chunks: list[str],
+        fallback_chunks: list[str],
+    ) -> list[str]:
+        if transcription_chunks:
+            return transcription_chunks
+        return fallback_chunks
 
     def _print_and_save_turn(
         self,
         input_chunks: list[str],
         output_chunks: list[str],
         memory_store: DialogueMemory | None,
+        system_action_runner: Callable[[str], object | None] | None,
+        transcript_tts: Any | None,
     ) -> None:
         user_text = ''.join(input_chunks).strip()
         assistant_text = ''.join(output_chunks).strip()
         input_chunks.clear()
         output_chunks.clear()
 
+        action_message: str | None = None
+        if user_text and system_action_runner is not None:
+            action_result = system_action_runner(user_text)
+            if action_result is not None:
+                action_message = str(getattr(action_result, 'message', action_result)).strip() or None
+
         if user_text:
             print(f"You> {user_text}")
         if assistant_text:
             print(f"The Herta> {assistant_text}")
+        if action_message:
+            print(f"System> {action_message}")
+            assistant_text = f"{assistant_text}\n\n{action_message}".strip()
         if user_text and assistant_text and memory_store is not None:
             try:
                 memory_store.append_turn(user_text, assistant_text)
             except Exception as exc:
                 logger.warning("Failed to save dialogue memory: %s", exc)
 
+        if assistant_text and transcript_tts is not None:
+            try:
+                transcript_tts.speak(assistant_text)
+            except Exception as exc:
+                logger.warning("Live transcript TTS failed: %s", exc)
+
     async def _receive_model_audio(
         self,
         session: Any,
-        output: LiveAudioOutput,
+        output: LiveAudioOutput | None,
         memory_store: DialogueMemory | None,
+        system_action_runner: Callable[[str], object | None] | None,
+        transcript_tts: Any | None,
     ) -> None:
         input_chunks: list[str] = []
-        output_chunks: list[str] = []
+        output_transcription_chunks: list[str] = []
+        fallback_output_chunks: list[str] = []
         audio_chunk_count = 0
         audio_byte_count = 0
 
@@ -164,10 +205,11 @@ class GoogleLiveVoiceClient:
                     audio_data = self._decode_audio_data(raw_audio)
                     audio_chunk_count += 1
                     audio_byte_count += len(audio_data)
-                    output.write_pcm16_mono(audio_data)
+                    if output is not None:
+                        output.write_pcm16_mono(audio_data)
 
                 text = getattr(response, 'text', None)
-                self._append_transcription(output_chunks, text)
+                self._append_transcription(fallback_output_chunks, text)
 
                 server_content = getattr(response, 'server_content', None)
                 if server_content is None:
@@ -177,7 +219,7 @@ class GoogleLiveVoiceClient:
                 self._append_transcription(input_chunks, getattr(input_transcription, 'text', None))
 
                 output_transcription = getattr(server_content, 'output_transcription', None)
-                self._append_transcription(output_chunks, getattr(output_transcription, 'text', None))
+                self._append_transcription(output_transcription_chunks, getattr(output_transcription, 'text', None))
 
                 model_turn = getattr(server_content, 'model_turn', None)
                 parts = getattr(model_turn, 'parts', None) or []
@@ -187,10 +229,11 @@ class GoogleLiveVoiceClient:
                         audio_data = self._decode_audio_data(inline_data.data)
                         audio_chunk_count += 1
                         audio_byte_count += len(audio_data)
-                        output.write_pcm16_mono(audio_data)
+                        if output is not None:
+                            output.write_pcm16_mono(audio_data)
 
                     part_text = getattr(part, 'text', None)
-                    self._append_transcription(output_chunks, part_text)
+                    self._append_transcription(fallback_output_chunks, part_text)
 
                 if getattr(server_content, 'turn_complete', False):
                     if audio_chunk_count > 0:
@@ -203,7 +246,15 @@ class GoogleLiveVoiceClient:
                         logger.warning(
                             "Google Live turn completed without audio chunks. Check live model and response_modalities."
                         )
-                    self._print_and_save_turn(input_chunks, output_chunks, memory_store)
+                    self._print_and_save_turn(
+                        input_chunks,
+                        self._select_output_chunks(output_transcription_chunks, fallback_output_chunks),
+                        memory_store,
+                        system_action_runner,
+                        transcript_tts,
+                    )
+                    output_transcription_chunks.clear()
+                    fallback_output_chunks.clear()
                     audio_chunk_count = 0
                     audio_byte_count = 0
 
@@ -214,6 +265,8 @@ class GoogleLiveVoiceClient:
         audio_config: AudioInputConfig,
         audio_output_config: AudioOutputConfig,
         memory_store: DialogueMemory | None,
+        system_action_runner: Callable[[str], object | None] | None = None,
+        transcript_tts: Any | None = None,
     ) -> None:
         self._validate_api_key()
 
@@ -230,7 +283,8 @@ class GoogleLiveVoiceClient:
             http_options={'api_version': self._api_version()},
         )
 
-        with LiveMicrophoneInput(audio_config) as microphone, LiveAudioOutput(audio_output_config) as output:
+        output_context = LiveAudioOutput(audio_output_config) if self.config.live_playback != 'rvc' else nullcontext(None)
+        with LiveMicrophoneInput(audio_config) as microphone, output_context as output:
             async with client.aio.live.connect(
                 model=self.config.live_model,
                 config=self._build_live_config(),
@@ -238,7 +292,9 @@ class GoogleLiveVoiceClient:
                 await self._seed_context(session, messages)
 
                 sender_task = asyncio.create_task(self._send_microphone_audio(session, microphone, types))
-                receiver_task = asyncio.create_task(self._receive_model_audio(session, output, memory_store))
+                receiver_task = asyncio.create_task(
+                    self._receive_model_audio(session, output, memory_store, system_action_runner, transcript_tts)
+                )
                 done, pending = await asyncio.wait(
                     {sender_task, receiver_task},
                     return_when=asyncio.FIRST_EXCEPTION,

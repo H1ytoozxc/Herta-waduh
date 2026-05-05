@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Protocol
 
+from actions.system_actions import SystemActionRunner, build_system_actions_instruction
 from brain.memory import DialogueMemory
 from config import AppConfig, load_config
 from llm.deepseek_client import DeepSeekChatClient
@@ -39,6 +40,39 @@ class ChatClient(Protocol):
 
 class TTSEngine(Protocol):
     def speak(self, text: str) -> None: ...
+
+
+class STTEngine(Protocol):
+    @property
+    def active_device(self) -> str: ...
+
+    def transcribe(self, audio) -> str: ...
+
+
+class FallbackSTTEngine:
+    def __init__(self, primary: STTEngine, fallback_factory, logger: logging.Logger) -> None:
+        self.primary = primary
+        self.fallback_factory = fallback_factory
+        self.logger = logger
+        self._fallback: STTEngine | None = None
+
+    @property
+    def active_device(self) -> str:
+        fallback_suffix = f"+{self._fallback.active_device}" if self._fallback is not None else "+fallback"
+        return f"{self.primary.active_device}{fallback_suffix}"
+
+    def _get_fallback(self) -> STTEngine:
+        if self._fallback is None:
+            self.logger.warning("Loading fallback Whisper STT after primary STT failure.")
+            self._fallback = self.fallback_factory()
+        return self._fallback
+
+    def transcribe(self, audio) -> str:
+        try:
+            return self.primary.transcribe(audio)
+        except Exception as exc:
+            self.logger.warning("Primary STT failed, trying fallback Whisper: %s", exc)
+            return self._get_fallback().transcribe(audio)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -149,8 +183,30 @@ def run_turn(
     logger: logging.Logger,
     locked_prefix_count: int,
     memory_store: DialogueMemory | None,
+    system_action_runner: SystemActionRunner | None,
 ) -> str:
     messages.append({"role": "user", "content": user_text})
+
+    action_result = system_action_runner.handle(user_text) if system_action_runner is not None else None
+    if action_result is not None:
+        assistant_reply = action_result.message
+        logger.info("System action handled: action=%s, executed=%s.", action_result.action_name, action_result.executed)
+        messages.append({"role": "assistant", "content": assistant_reply})
+        if memory_store is not None:
+            try:
+                memory_store.append_turn(user_text, assistant_reply)
+            except Exception as exc:
+                logger.warning("Failed to save dialogue memory: %s", exc)
+
+        messages[:] = trim_history(messages, config.max_history_messages, locked_prefix_count)
+
+        if tts_engine is not None:
+            try:
+                tts_engine.speak(assistant_reply)
+            except Exception as exc:  # pragma: no cover - depends on local audio/network state
+                logger.warning("TTS playback failed: %s", exc)
+
+        return assistant_reply
 
     logger.info(
         "Generating reply with %s model '%s'...",
@@ -195,6 +251,7 @@ def interactive_loop(
     logger: logging.Logger,
     locked_prefix_count: int,
     memory_store: DialogueMemory | None,
+    system_action_runner: SystemActionRunner | None,
 ) -> None:
     print("The Herta assistant ready. Type a message or 'exit' to quit.")
 
@@ -221,12 +278,52 @@ def interactive_loop(
                 logger=logger,
                 locked_prefix_count=locked_prefix_count,
                 memory_store=memory_store,
+                system_action_runner=system_action_runner,
             )
         except Exception as exc:
             logger.error("Assistant turn failed: %s", exc)
             continue
 
         print(f"The Herta> {assistant_reply}")
+
+
+def _prepare_stt_engine(config: AppConfig, logger: logging.Logger) -> STTEngine:
+    provider = config.stt_provider.strip().lower()
+
+    if provider in {"whisper", "faster_whisper", "faster-whisper"}:
+        from stt.whisper_stt import FasterWhisperSTT
+
+        print(
+            f"Preparing voice mode. Loading Whisper model '{config.stt.model_size}' on device '{config.stt.device}'. "
+            "On first run this may download files and take a few minutes."
+        )
+        if config.stt.model_size == "tiny":
+            print("Warning: Whisper 'tiny' is fast, but its Russian STT quality is limited. Prefer 'small' for better accuracy.")
+        return FasterWhisperSTT(config.stt)
+
+    if provider in {"google_ai", "google", "gemini"}:
+        from stt.google_ai_stt import GoogleAITranscriptionSTT
+        from stt.whisper_stt import FasterWhisperSTT
+
+        print(
+            f"Preparing Google AI STT model '{config.google_stt.model}'. "
+            "This sends each detected utterance to Google for transcription."
+        )
+        primary = GoogleAITranscriptionSTT(
+            config.google_stt,
+            audio_gate_config=config.stt,
+            sample_rate=config.audio.sample_rate,
+        )
+        if not config.google_stt.fallback_to_whisper:
+            return primary
+
+        return FallbackSTTEngine(
+            primary,
+            fallback_factory=lambda: FasterWhisperSTT(config.stt),
+            logger=logger,
+        )
+
+    raise ValueError("Unsupported STT_PROVIDER. Use 'whisper' or 'google_ai'.")
 
 
 
@@ -239,10 +336,10 @@ def voice_loop(
     logger: logging.Logger,
     locked_prefix_count: int,
     memory_store: DialogueMemory | None,
+    system_action_runner: SystemActionRunner | None,
 ) -> None:
     from audio.input import MicrophoneInput
     from audio.vad import StreamingVADSegmenter
-    from stt.whisper_stt import FasterWhisperSTT
 
     provider_name = config.llm_provider
     model_name = _selected_model_name(config)
@@ -260,24 +357,13 @@ def voice_loop(
             warmup_error_suffix,
         )
 
-    print(
-        f"Preparing voice mode. Loading Whisper model '{config.stt.model_size}' on device '{config.stt.device}'. "
-        "On first run this may download files and take a few minutes."
-    )
-
-    if config.stt.model_size == "tiny":
-        print("Warning: Whisper 'tiny' is fast, but its Russian STT quality is limited. Prefer 'small' for better accuracy.")
-
     try:
-        stt_engine = FasterWhisperSTT(config.stt)
+        stt_engine = _prepare_stt_engine(config, logger)
     except KeyboardInterrupt:
         print("\nSTT model loading interrupted.")
         return
 
-    print(
-        f"STT model ready. active_device={stt_engine.active_device}, beam_size={config.stt.beam_size}, "
-        f"language={config.stt.language!r}."
-    )
+    print(f"STT ready. provider={config.stt_provider}, active_device={stt_engine.active_device}.")
 
     microphone = MicrophoneInput(config.audio)
     vad_segmenter = StreamingVADSegmenter(config.audio, config.vad)
@@ -325,6 +411,7 @@ def voice_loop(
                     logger=logger,
                     locked_prefix_count=locked_prefix_count,
                     memory_store=memory_store,
+                    system_action_runner=system_action_runner,
                 )
             except Exception as exc:
                 logger.error("Assistant turn failed: %s", exc)
@@ -339,6 +426,8 @@ def google_live_voice_loop(
     config: AppConfig,
     logger: logging.Logger,
     memory_store: DialogueMemory | None,
+    system_action_runner: SystemActionRunner | None,
+    tts_engine: TTSEngine | None,
 ) -> None:
     client = GoogleLiveVoiceClient(config.google_ai)
     model_name = config.google_ai.live_model
@@ -361,12 +450,18 @@ def google_live_voice_loop(
         f"sample_rate=24000, channels={config.audio_output.channels}."
     )
     print(f"Google Live voice preset: {config.google_ai.live_voice_name or 'auto'}.")
+    if config.google_ai.live_playback == 'rvc':
+        print("Google Live playback mode: RVC. Google audio is ignored; output transcript is spoken by local RVC.")
+    else:
+        print("Google Live playback mode: Google native audio.")
     asyncio.run(
         client.run_voice_loop(
             messages=messages,
             audio_config=config.audio,
             audio_output_config=config.audio_output,
             memory_store=memory_store,
+            system_action_runner=(system_action_runner.handle if system_action_runner is not None else None),
+            transcript_tts=tts_engine if config.google_ai.live_playback == 'rvc' else None,
         )
     )
 
@@ -449,7 +544,11 @@ def _build_chat_client(config: AppConfig) -> ChatClient:
 
 
 def _build_tts_engine(config: AppConfig, *, no_tts: bool, live_voice: bool) -> TTSEngine | None:
-    if no_tts or live_voice:
+    if no_tts:
+        return None
+    if live_voice and config.google_ai.live_playback != 'rvc':
+        return None
+    if live_voice and not config.rvc_tts.enabled:
         return None
     if config.rvc_tts.enabled:
         from tts.rvc_tts_engine import RvcTTSEngine
@@ -497,8 +596,13 @@ def main() -> int:
         return run_output_test(config, logger)
 
     tts_engine = _build_tts_engine(config, no_tts=args.no_tts, live_voice=args.live_voice)
+    live_uses_rvc_tts = args.live_voice and config.google_ai.live_playback == 'rvc'
 
-    if args.live_voice:
+    if live_uses_rvc_tts and not config.rvc_tts.enabled:
+        print("GOOGLE_AI_LIVE_PLAYBACK='rvc' requires RVC_TTS_ENABLED='true'.")
+        return 1
+
+    if args.live_voice and not live_uses_rvc_tts:
         print("Local TTS disabled for Google Live native audio mode.")
     elif tts_engine is None:
         print("TTS disabled for this run.")
@@ -525,6 +629,13 @@ def main() -> int:
         print(f"Configured output device: {_describe_output_device(config.audio_output.device)}")
         print(f"Piper model: {config.tts.piper_model_path!r}")
 
+    system_action_runner = SystemActionRunner(config.system_actions, logger)
+    if config.system_actions.enabled:
+        print(
+            "System actions enabled: browser, VS Code, and safe .txt creation only. "
+            "Delete/move/overwrite requests are blocked; rename is limited to Herta-created items."
+        )
+
     if args.tts_test:
         if tts_engine is None:
             print("TTS is disabled. Remove --no-tts or enable TTS in config.")
@@ -545,6 +656,8 @@ def main() -> int:
 
     selected_model_name = config.google_ai.live_model if args.live_voice else _selected_model_name(config)
     messages = build_bootstrap_messages(selected_model_name)
+    if config.system_actions.enabled:
+        messages.append({"role": "system", "content": build_system_actions_instruction()})
     locked_prefix_count = len(messages)
     memory_store = _build_memory_store(config, logger)
     if memory_store is not None:
@@ -559,6 +672,8 @@ def main() -> int:
                 config=config,
                 logger=logger,
                 memory_store=memory_store,
+                system_action_runner=system_action_runner,
+                tts_engine=tts_engine,
             )
         except KeyboardInterrupt:
             print()
@@ -580,6 +695,7 @@ def main() -> int:
                 logger=logger,
                 locked_prefix_count=locked_prefix_count,
                 memory_store=memory_store,
+                system_action_runner=system_action_runner,
             )
         except Exception as exc:
             logger.error("Assistant turn failed: %s", exc)
@@ -598,6 +714,7 @@ def main() -> int:
                 logger=logger,
                 locked_prefix_count=locked_prefix_count,
                 memory_store=memory_store,
+                system_action_runner=system_action_runner,
             )
         except Exception as exc:
             logger.error("Voice loop failed: %s", exc)
@@ -612,6 +729,7 @@ def main() -> int:
         logger=logger,
         locked_prefix_count=locked_prefix_count,
         memory_store=memory_store,
+        system_action_runner=system_action_runner,
     )
     return 0
 

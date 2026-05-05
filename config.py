@@ -83,10 +83,11 @@ class GoogleAIConfig:
     api_key: str | None = None
     base_url: str = 'https://generativelanguage.googleapis.com/v1beta'
     model: str = 'gemma-3-27b-it'
-    timeout_seconds: float = 120.0
+    fallback_model: str | None = None
+    timeout_seconds: float = 45.0
     temperature: float = 0.55
     max_tokens: int = 700
-    retry_attempts: int = 4
+    retry_attempts: int = 0
     rate_limit_retries: int = 2
     system_instruction_enabled: bool = False
     live_model: str = 'gemini-3.1-flash-live-preview'
@@ -98,6 +99,19 @@ class GoogleAIConfig:
     live_proactive_audio: bool = False
     live_input_transcription: bool = True
     live_output_transcription: bool = True
+    live_playback: str = 'google'
+
+
+@dataclass(slots=True)
+class GoogleSTTConfig:
+    api_key: str | None = None
+    base_url: str = 'https://generativelanguage.googleapis.com/v1beta'
+    model: str = 'gemini-2.5-flash'
+    timeout_seconds: float = 60.0
+    retry_attempts: int = 3
+    rate_limit_retries: int = 2
+    language_hint: str | None = 'ru'
+    fallback_to_whisper: bool = True
 
 
 @dataclass(slots=True)
@@ -201,14 +215,26 @@ class MemoryConfig:
 
 
 @dataclass(slots=True)
+class SystemActionsConfig:
+    enabled: bool = False
+    document_dir: str = 'desktop'
+    registry_path: str = 'data/system_actions_registry.json'
+    browser_home_url: str = 'https://www.google.com'
+    vscode_command: str = 'code'
+    vscode_open_workspace: bool = True
+
+
+@dataclass(slots=True)
 class AppConfig:
     log_level: str = 'INFO'
     llm_provider: str = 'ollama'
+    stt_provider: str = 'whisper'
     max_history_messages: int = 8
     persona_rewrite_enabled: bool = False
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     deepseek: DeepSeekConfig = field(default_factory=DeepSeekConfig)
     google_ai: GoogleAIConfig = field(default_factory=GoogleAIConfig)
+    google_stt: GoogleSTTConfig = field(default_factory=GoogleSTTConfig)
     tts: EdgeTTSConfig = field(default_factory=EdgeTTSConfig)
     rvc_tts: RvcTTSConfig = field(default_factory=RvcTTSConfig)
     audio: AudioInputConfig = field(default_factory=AudioInputConfig)
@@ -216,12 +242,14 @@ class AppConfig:
     vad: VadConfig = field(default_factory=VadConfig)
     stt: WhisperSTTConfig = field(default_factory=WhisperSTTConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    system_actions: SystemActionsConfig = field(default_factory=SystemActionsConfig)
 
 
 def load_config() -> AppConfig:
     return AppConfig(
         log_level=os.getenv('LOG_LEVEL', 'INFO').upper(),
         llm_provider=os.getenv('LLM_PROVIDER', 'ollama').strip().lower(),
+        stt_provider=os.getenv('STT_PROVIDER', 'whisper').strip().lower(),
         max_history_messages=int(os.getenv('MAX_HISTORY_MESSAGES', '8')),
         persona_rewrite_enabled=_get_bool(os.getenv('PERSONA_REWRITE_ENABLED'), False),
         ollama=OllamaConfig(
@@ -248,10 +276,11 @@ def load_config() -> AppConfig:
             api_key=_get_optional_str(os.getenv('GOOGLE_AI_API_KEY')) or _get_optional_str(os.getenv('GEMINI_API_KEY')),
             base_url=os.getenv('GOOGLE_AI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta'),
             model=os.getenv('GOOGLE_AI_MODEL', 'gemma-3-27b-it'),
-            timeout_seconds=float(os.getenv('GOOGLE_AI_TIMEOUT_SECONDS', '120')),
+            fallback_model=_get_optional_str(os.getenv('GOOGLE_AI_FALLBACK_MODEL')),
+            timeout_seconds=float(os.getenv('GOOGLE_AI_TIMEOUT_SECONDS', '45')),
             temperature=float(os.getenv('GOOGLE_AI_TEMPERATURE', '0.55')),
             max_tokens=int(os.getenv('GOOGLE_AI_MAX_TOKENS', '700')),
-            retry_attempts=int(os.getenv('GOOGLE_AI_RETRY_ATTEMPTS', '4')),
+            retry_attempts=int(os.getenv('GOOGLE_AI_RETRY_ATTEMPTS', '0')),
             rate_limit_retries=int(os.getenv('GOOGLE_AI_RATE_LIMIT_RETRIES', '2')),
             system_instruction_enabled=_get_bool(os.getenv('GOOGLE_AI_SYSTEM_INSTRUCTION_ENABLED'), False),
             live_model=os.getenv('GOOGLE_AI_LIVE_MODEL', 'gemini-3.1-flash-live-preview'),
@@ -263,6 +292,21 @@ def load_config() -> AppConfig:
             live_proactive_audio=_get_bool(os.getenv('GOOGLE_AI_LIVE_PROACTIVE_AUDIO'), False),
             live_input_transcription=_get_bool(os.getenv('GOOGLE_AI_LIVE_INPUT_TRANSCRIPTION'), True),
             live_output_transcription=_get_bool(os.getenv('GOOGLE_AI_LIVE_OUTPUT_TRANSCRIPTION'), True),
+            live_playback=os.getenv('GOOGLE_AI_LIVE_PLAYBACK', 'google').strip().lower(),
+        ),
+        google_stt=GoogleSTTConfig(
+            api_key=(
+                _get_optional_str(os.getenv('GOOGLE_STT_API_KEY'))
+                or _get_optional_str(os.getenv('GOOGLE_AI_API_KEY'))
+                or _get_optional_str(os.getenv('GEMINI_API_KEY'))
+            ),
+            base_url=os.getenv('GOOGLE_STT_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta'),
+            model=os.getenv('GOOGLE_STT_MODEL', 'gemini-2.5-flash'),
+            timeout_seconds=float(os.getenv('GOOGLE_STT_TIMEOUT_SECONDS', '60')),
+            retry_attempts=int(os.getenv('GOOGLE_STT_RETRY_ATTEMPTS', '3')),
+            rate_limit_retries=int(os.getenv('GOOGLE_STT_RATE_LIMIT_RETRIES', '2')),
+            language_hint=_get_optional_str(os.getenv('GOOGLE_STT_LANGUAGE_HINT', 'ru')),
+            fallback_to_whisper=_get_bool(os.getenv('GOOGLE_STT_FALLBACK_TO_WHISPER'), True),
         ),
         tts=EdgeTTSConfig(
             enabled=_get_bool(os.getenv('EDGE_TTS_ENABLED'), True),
@@ -349,5 +393,13 @@ def load_config() -> AppConfig:
             path=os.getenv('MEMORY_PATH', 'data/dialogue_memory.json'),
             max_messages=int(os.getenv('MEMORY_MAX_MESSAGES', '80')),
             context_messages=int(os.getenv('MEMORY_CONTEXT_MESSAGES', '12')),
+        ),
+        system_actions=SystemActionsConfig(
+            enabled=_get_bool(os.getenv('SYSTEM_ACTIONS_ENABLED'), False),
+            document_dir=os.getenv('SYSTEM_ACTIONS_DOCUMENT_DIR', 'desktop'),
+            registry_path=os.getenv('SYSTEM_ACTIONS_REGISTRY_PATH', 'data/system_actions_registry.json'),
+            browser_home_url=os.getenv('SYSTEM_ACTIONS_BROWSER_HOME_URL', 'https://www.google.com'),
+            vscode_command=os.getenv('SYSTEM_ACTIONS_VSCODE_COMMAND', 'code'),
+            vscode_open_workspace=_get_bool(os.getenv('SYSTEM_ACTIONS_VSCODE_OPEN_WORKSPACE'), True),
         ),
     )
