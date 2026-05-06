@@ -114,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="List available output audio devices and exit.",
     )
     parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run a quick local diagnostics report and exit.",
+    )
+    parser.add_argument(
         "--no-tts",
         action="store_true",
         help="Disable speech output for this run.",
@@ -591,6 +596,11 @@ def main() -> int:
     config = load_config()
     configure_logging(config.log_level)
     logger = logging.getLogger("the_herta.main")
+
+    if args.doctor:
+        from doctor import run_doctor
+
+        return run_doctor(config)
 
     if args.output_test:
         return run_output_test(config, logger)

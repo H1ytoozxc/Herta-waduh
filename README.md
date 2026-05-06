@@ -313,6 +313,14 @@ python main.py --list-devices
 python main.py --list-output-devices
 ```
 
+Запусти быструю диагностику окружения:
+
+```powershell
+python main.py --doctor
+```
+
+`--doctor` не запускает разговор, не включает микрофонный цикл и не прогревает RVC. Он проверяет Python, зависимости, выбранные модели, наличие API-ключа, аудиоустройства, память, системные действия и локальные RVC-пути.
+
 Найди в списке индекс микрофона и индекс колонок/наушников. Например:
 
 ```text
@@ -581,6 +589,9 @@ Whisper долго загружается:
 RVC очень медленный:
 это ожидаемо. `RVC_BACKEND='persistent'` убирает повторную загрузку модели между ответами, но сама конвертация каждого аудиофайла все равно занимает время.
 
+`python main.py --doctor` показывает `FAIL`:
+исправь строки `FAIL` сверху вниз. `WARN` обычно не блокирует запуск, но показывает потенциальную проблему: например отключенную память, отсутствующий `.index` для RVC или не найденную команду `code`.
+
 ## Быстрый старт
 
 Текстовый режим:
@@ -599,6 +610,12 @@ python main.py --no-tts
 
 ```powershell
 python main.py --list-devices
+```
+
+Диагностика окружения:
+
+```powershell
+python main.py --doctor
 ```
 
 Основной голосовой режим через Gemini 3.1 Flash Live:
@@ -799,7 +816,7 @@ rg -n --hidden --glob '!venv/**' --glob '!.venv/**' --glob '!data/**' "sk-or-v1-
 Точечный `git add` для текущей версии, без `data/` и `.env`:
 
 ```powershell
-git add README.md config.py main.py persona/the_herta.py actions/__init__.py actions/system_actions.py llm/google_ai_client.py llm/google_live_client.py stt/google_ai_stt.py
+git add README.md config.py main.py doctor.py persona/the_herta.py actions/__init__.py actions/system_actions.py llm/google_ai_client.py llm/google_live_client.py stt/google_ai_stt.py
 
 git diff --cached --name-only
 git commit -m "Add Gemini Live voice, safe OS actions, and Herta persona"
