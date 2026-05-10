@@ -1,0 +1,42 @@
+[package]
+name = "herta-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LLM provider abstractions and implementations (Ollama, DeepSeek, Google AI)"
+
+[lints]
+workspace = true
+
+[features]
+default = ["ollama", "deepseek", "google-ai"]
+ollama = []
+deepseek = []
+google-ai = []
+
+[dependencies]
+herta-core = { workspace = true }
+herta-config = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+backon = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+wiremock = { workspace = true }
+mockito = { workspace = true }
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }
+proptest = { workspace = true }

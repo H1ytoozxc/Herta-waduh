@@ -1,0 +1,39 @@
+[package]
+name = "herta-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pluggable dialogue memory/persistence backends (JSON, SQLite, Sled)"
+
+[lints]
+workspace = true
+
+[features]
+default = ["json-backend"]
+json-backend = []
+sqlite-backend = ["dep:rusqlite"]
+sled-backend = ["dep:sled"]
+
+[dependencies]
+herta-core = { workspace = true }
+herta-config = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+parking_lot = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+sled = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-test = { workspace = true }
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
+rstest = { workspace = true }

@@ -1,0 +1,39 @@
+[package]
+name = "herta-stt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Speech-to-text abstractions and providers (local + cloud)"
+
+[lints]
+workspace = true
+
+[features]
+default = ["google-ai"]
+google-ai = []
+whisper-local = []
+
+[dependencies]
+herta-core = { workspace = true }
+herta-config = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+backon = { workspace = true }
+hound = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+wiremock = { workspace = true }
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }

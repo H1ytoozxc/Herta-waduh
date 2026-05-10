@@ -1,0 +1,35 @@
+[package]
+name = "herta-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cross-platform audio input/output abstractions (CPAL + mock)"
+
+[lints]
+workspace = true
+
+[features]
+default = ["cpal-backend"]
+cpal-backend = ["dep:cpal"]
+
+[dependencies]
+herta-core = { workspace = true }
+herta-config = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+cpal = { workspace = true, optional = true }
+rubato = { workspace = true }
+hound = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }
+tempfile = { workspace = true }

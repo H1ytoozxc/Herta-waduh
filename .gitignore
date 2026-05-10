@@ -1,44 +1,35 @@
-﻿# Virtual environments
-.venv/
-venv/
-env/
+# Ignore build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
 
-# Python cache and build artifacts
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-build/
-dist/
+# Local state and data
+data/
+**/*.sqlite
+**/*.sqlite-journal
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.sled
 
-# Test and tooling caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+.DS_Store
 
-# Local environment files
+# Coverage
+tarpaulin-report.html
+lcov.info
+
+# Tracing dumps
+*.folded
+perf.data*
+flamegraph.svg
+
+# Secrets and local overrides
 .env
 .env.*
+!.env.example
 
-# IDE and editor files
-.vscode/
-.idea/
-*.code-workspace
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Temporary audio and logs
-*.wav
-*.mp3
-*.log
-data/
-
-# Local model and cache directories if added later
-models/
-.cache/
+# Docker
+.dockerignore

@@ -1,0 +1,181 @@
+---
+# Kubernetes manifests for The Herta (Rust edition).
+#
+# Applies a Deployment, Service, and ConfigMap for a text-mode deployment.
+# Voice mode is intentionally omitted because live audio devices are not
+# typically exposed to pods; run voice locally or attach via a sidecar with
+# PulseAudio over TCP.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: the-herta
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: herta-config
+  namespace: the-herta
+data:
+  config.yaml: |
+    log_level: INFO
+    llm_provider: ollama
+    stt_provider: whisper
+    max_history_messages: 8
+    persona_rewrite_enabled: false
+
+    telemetry:
+      log_format: json
+      metrics_enabled: true
+      tracing_enabled: false
+      service_name: the-herta
+      environment: production
+
+    server:
+      enabled: true
+      bind: "0.0.0.0:9090"
+
+    memory:
+      enabled: true
+      backend: json
+      path: "/var/lib/herta/dialogue_memory.json"
+      max_messages: 80
+      context_messages: 12
+
+    tts:
+      enabled: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: herta-secrets
+  namespace: the-herta
+type: Opaque
+stringData:
+  # Rotate these via an external secret manager (e.g. SealedSecrets,
+  # ExternalSecrets, Vault). Do NOT commit real values.
+  HERTA_DEEPSEEK__API_KEY: ""
+  HERTA_GOOGLE_AI__API_KEY: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: the-herta
+  namespace: the-herta
+  labels:
+    app.kubernetes.io/name: the-herta
+    app.kubernetes.io/version: "0.1.0"
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: the-herta
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: the-herta
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: herta
+          image: ghcr.io/anomalyco/the-herta:latest
+          imagePullPolicy: IfNotPresent
+          args: ["repl", "--no-tts", "--non-interactive"]
+          env:
+            - name: HERTA_TELEMETRY__ENVIRONMENT
+              value: production
+          envFrom:
+            - secretRef:
+                name: herta-secrets
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/herta
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/herta
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: herta-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: the-herta
+  namespace: the-herta
+  labels:
+    app.kubernetes.io/name: the-herta
+spec:
+  selector:
+    app.kubernetes.io/name: the-herta
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: the-herta
+  namespace: the-herta
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: the-herta

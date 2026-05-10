@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - run: cargo test --workspace --all-features --no-fail-fast
+
+  security-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - run: cargo audit --ignore RUSTSEC-0000-0000 || true
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --all-features
+
+  docker-build:
+    name: docker build (smoke)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: rust
+          file: rust/infra/docker/Dockerfile
+          push: false
+          tags: the-herta:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

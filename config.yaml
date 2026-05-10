@@ -1,0 +1,144 @@
+# Example configuration for The Herta (Rust edition).
+#
+# Precedence (higher wins):
+#   1. Environment variables (HERTA_* with __ separators).
+#   2. This file (config.yaml) at workspace root.
+#   3. Compile-time defaults.
+#
+# Secrets MUST be supplied via environment variables in production; they are
+# accepted in this file only for local development.
+
+log_level: INFO                  # HERTA_LOG_LEVEL
+llm_provider: ollama             # HERTA_LLM_PROVIDER (ollama|deepseek|google_ai)
+stt_provider: whisper            # HERTA_STT_PROVIDER (whisper|google_ai)
+max_history_messages: 8          # HERTA_MAX_HISTORY_MESSAGES
+persona_rewrite_enabled: false   # HERTA_PERSONA_REWRITE_ENABLED
+
+telemetry:
+  log_format: pretty             # pretty|compact|json
+  metrics_enabled: true          # enable the Prometheus exporter
+  tracing_enabled: false         # enable OTLP distributed tracing
+  otlp_endpoint: null            # e.g. "http://otel-collector:4317"
+  service_name: the-herta
+  environment: dev
+
+server:
+  enabled: true
+  bind: "0.0.0.0:9090"
+  health_path: /healthz
+  metrics_path: /metrics
+  readiness_path: /ready
+
+ollama:
+  host: "http://127.0.0.1:11434"     # HERTA_OLLAMA__HOST
+  model: "qwen3:4b"                  # HERTA_OLLAMA__MODEL
+  timeout_seconds: 300.0
+  keep_alive: "10m"
+  think: false
+  temperature: 0.55
+  num_ctx: 2048
+  num_gpu: null
+
+deepseek:
+  api_key: null                      # HERTA_DEEPSEEK__API_KEY (secret)
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-v4-flash"
+  timeout_seconds: 120.0
+  temperature: 0.55
+  max_tokens: 700
+  retry_attempts: 4
+  rate_limit_retries: 2
+
+google_ai:
+  api_key: null                      # HERTA_GOOGLE_AI__API_KEY (secret)
+  base_url: "https://generativelanguage.googleapis.com/v1beta"
+  model: "gemma-3-27b-it"
+  fallback_model: null
+  timeout_seconds: 45.0
+  temperature: 0.55
+  max_tokens: 700
+  retry_attempts: 0
+  rate_limit_retries: 2
+  system_instruction_enabled: false
+
+google_stt:
+  api_key: null                      # HERTA_GOOGLE_STT__API_KEY (secret)
+  base_url: "https://generativelanguage.googleapis.com/v1beta"
+  model: "gemini-2.5-flash"
+  timeout_seconds: 60.0
+  retry_attempts: 3
+  rate_limit_retries: 2
+  language_hint: "ru"
+  fallback_to_whisper: true
+
+tts:
+  enabled: true
+  prefer_local: true
+  voice: "ru-RU-DariyaNeural"
+  rate: "-6%"
+  volume: "+0%"
+  pitch: "+8Hz"
+  sapi_voice: "Microsoft Irina Desktop - Russian"
+  sapi_rate: 0
+  sapi_volume: 100
+  piper_model_path: "models/piper/ru_RU-irina-medium.onnx"
+  piper_config_path: null
+  piper_use_cuda: false
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  dtype: float32
+  block_size: 512
+  device: null                       # substring of device name to match
+  queue_max_chunks: 128
+
+audio_output:
+  sample_rate: 44100
+  channels: 2
+  dtype: float32
+  device: null
+  tone_frequency_hz: 523.25
+  tone_duration_seconds: 0.7
+  tone_volume: 0.2
+
+vad:
+  threshold: 0.5
+  min_silence_duration_ms: 600
+  speech_pad_ms: 200
+  min_utterance_duration_ms: 450
+  max_utterance_seconds: 20.0
+
+stt:
+  model_size: small
+  device: cpu
+  compute_type: int8
+  cpu_threads: 4
+  num_workers: 1
+  language: null
+  beam_size: 5
+  best_of: 5
+  no_speech_threshold: 0.6
+  log_prob_threshold: -0.8
+  compression_ratio_threshold: 2.2
+  min_peak_level: 0.01
+  min_rms_level: 0.0015
+  normalize_audio: true
+  local_files_only: false
+  download_root: null
+  initial_prompt: null
+
+memory:
+  enabled: true
+  backend: json                      # json|sqlite|sled|in_memory
+  path: "data/dialogue_memory.json"
+  max_messages: 80
+  context_messages: 12
+
+system_actions:
+  enabled: false
+  document_dir: desktop
+  registry_path: "data/system_actions_registry.json"
+  browser_home_url: "https://www.google.com"
+  vscode_command: code
+  vscode_open_workspace: true
